@@ -4,6 +4,8 @@ extends Node2D
 ## The snake is pure data (an array of grid cells); all rendering happens in _draw().
 ## Visuals interpolate between the previous and current tick so movement glides,
 ## while the simulation itself stays strictly grid-based.
+## Two modes: Classic (walls kill) and Zen (walls wrap around). Food and snake are drawn
+## on Playfield inside the clipping Board control, so wrapped segments are cut at the edge.
 
 enum State { READY, PLAYING, PAUSED, GAME_OVER }
 
@@ -22,6 +24,7 @@ const MAX_BUFFERED_INPUTS := 2
 const BOARD_COLOR := Color("12151c")
 const BOARD_ALT_COLOR := Color("151922")
 const BOARD_BORDER_COLOR := Color("232a38")
+const ZEN_BORDER_COLOR := Color("2a8f86") # Teal border signals the walls are open.
 const HEAD_COLOR := Color("7cf29a")
 const TAIL_COLOR := Color("1f8f5f")
 const FOOD_COLOR := Color("ff5c7a")
@@ -35,10 +38,13 @@ const TAIL_TAPER := 0.7 # Tail radius as a fraction of the head's.
 const SHAKE_PIXELS := 8.0
 
 @onready var move_timer: Timer = $MoveTimer
+@onready var board: Control = $Board
+@onready var playfield: Node2D = $Board/Playfield
 @onready var score_label: Label = $CanvasLayer/ScoreLabel
 @onready var message_label: Label = $CanvasLayer/MessageLabel
 
 var state: State = State.READY
+var wrap_walls := false # Zen mode.
 var snake: Array[Vector2i] = [] # Head first.
 var prev_snake: Array[Vector2i] = [] # Snake as of the previous tick, for interpolation.
 var direction := Vector2i.RIGHT
@@ -62,21 +68,24 @@ var _sfx: Dictionary[StringName, AudioStreamPlayer] = {}
 
 func _ready() -> void:
 	_board_style.bg_color = BOARD_COLOR
-	_board_style.border_color = BOARD_BORDER_COLOR
 	_board_style.set_border_width_all(2)
 	_board_style.set_corner_radius_all(12)
 	_build_sfx()
 
 	move_timer.timeout.connect(_on_move_timer_timeout)
+	playfield.draw.connect(_draw_playfield)
 	get_viewport().size_changed.connect(_update_board_origin)
 	_update_board_origin()
-	_load_high_score()
+	_load_save()
 	_reset()
 
 
 func _process(delta: float) -> void:
 	time += delta
+	# Shake the whole node; the HUD lives on a CanvasLayer so it stays put.
+	position = Vector2(randf_range(-1.0, 1.0), randf_range(-1.0, 1.0)) * SHAKE_PIXELS * shake
 	queue_redraw()
+	playfield.queue_redraw()
 
 
 func _notification(what: int) -> void:
@@ -99,6 +108,10 @@ func _unhandled_input(event: InputEvent) -> void:
 			State.GAME_OVER:
 				_reset()
 				_start()
+		return
+
+	if _is_key(event, KEY_M) and state in [State.READY, State.GAME_OVER]:
+		_toggle_mode()
 		return
 
 	var dir := _direction_from_event(event)
@@ -131,10 +144,14 @@ func _direction_from_event(event: InputEvent) -> Vector2i:
 
 
 func _is_pause_event(event: InputEvent) -> bool:
-	if event.is_action_pressed("ui_cancel"):
-		return true
+	return event.is_action_pressed("ui_cancel") or _is_key(event, KEY_P)
+
+
+## Mnemonic shortcuts (M for mode, P for pause) follow the printed key label,
+## unlike WASD which is matched by physical position.
+func _is_key(event: InputEvent, keycode: Key) -> bool:
 	return event is InputEventKey and event.pressed and not event.echo \
-			and event.physical_keycode == KEY_P
+			and event.keycode == keycode
 
 
 ## Queue turns so two quick presses within one tick both register,
@@ -155,6 +172,8 @@ func _on_move_timer_timeout() -> void:
 		direction = input_queue.pop_front()
 
 	var new_head := snake[0] + direction
+	if wrap_walls:
+		new_head = _wrap(new_head)
 	var grows := new_head == food
 
 	# The tail vacates its cell this tick unless we're growing, so the head may follow it.
@@ -188,7 +207,21 @@ func _reset() -> void:
 	_update_score()
 	_spawn_food()
 	state = State.READY
-	_show_message("SNAKE\n\nArrows / WASD to move\nEsc / P to pause\n\nPress Space to start")
+	_board_style.border_color = ZEN_BORDER_COLOR if wrap_walls else BOARD_BORDER_COLOR
+	_show_message("SNAKE\n\n%s\n\nArrows / WASD to move\nEsc / P to pause\n\nPress Space to start" \
+			% _mode_line())
+
+
+func _toggle_mode() -> void:
+	wrap_walls = not wrap_walls
+	_save_value("settings", "wrap_walls", wrap_walls)
+	high_score = _load_value("scores", _high_score_key(), 0)
+	_play_sfx(&"pause", 1.25)
+	_reset()
+
+
+func _mode_line() -> String:
+	return "Mode: %s   (M to switch)" % ("ZEN - walls wrap" if wrap_walls else "CLASSIC")
 
 
 func _start() -> void:
@@ -218,13 +251,13 @@ func _game_over(won: bool) -> void:
 	var new_best := score > high_score
 	if new_best:
 		high_score = score
-		_save_high_score()
+		_save_value("scores", _high_score_key(), high_score)
 		_update_score()
 
 	var lines: PackedStringArray = ["YOU WIN!" if won else "GAME OVER", "", "Score: %d" % score]
 	if new_best:
 		lines.append("New best!")
-	lines.append_array(PackedStringArray(["", "Press Space to restart"]))
+	lines.append_array(PackedStringArray(["", "Press Space to restart", _mode_line()]))
 	_show_message("\n".join(lines))
 
 
@@ -284,19 +317,30 @@ func _play_death_feedback() -> void:
 	tween.tween_property(self, "death_flash", 0.0, 0.45).from(1.0)
 
 
-func _load_high_score() -> void:
+func _load_save() -> void:
+	wrap_walls = _load_value("settings", "wrap_walls", false)
+	high_score = _load_value("scores", _high_score_key(), 0)
+
+
+## Classic keeps the original key so existing saves carry over.
+func _high_score_key() -> String:
+	return "high_score_zen" if wrap_walls else "high_score"
+
+
+func _load_value(section: String, key: String, default: Variant) -> Variant:
 	var config := ConfigFile.new()
-	if config.load(SAVE_PATH) == OK:
-		high_score = config.get_value("scores", "high_score", 0)
+	if config.load(SAVE_PATH) != OK:
+		return default
+	return config.get_value(section, key, default)
 
 
-func _save_high_score() -> void:
+func _save_value(section: String, key: String, value: Variant) -> void:
 	var config := ConfigFile.new()
 	config.load(SAVE_PATH) # Keep any other saved keys; a missing file is fine.
-	config.set_value("scores", "high_score", high_score)
+	config.set_value(section, key, value)
 	var err := config.save(SAVE_PATH)
 	if err != OK:
-		push_warning("Could not save high score: %s" % error_string(err))
+		push_warning("Could not save %s/%s: %s" % [section, key, error_string(err)])
 
 
 func _spawn_food() -> void:
@@ -313,15 +357,31 @@ func _spawn_food() -> void:
 
 
 func _update_score() -> void:
-	score_label.text = "Score: %d      Best: %d" % [score, high_score]
+	score_label.text = "%s      Score: %d      Best: %d" \
+			% ["ZEN" if wrap_walls else "CLASSIC", score, high_score]
 
 
 func _in_bounds(cell: Vector2i) -> bool:
 	return cell.x >= 0 and cell.y >= 0 and cell.x < GRID_SIZE.x and cell.y < GRID_SIZE.y
 
 
+func _wrap(cell: Vector2i) -> Vector2i:
+	return Vector2i(posmod(cell.x, GRID_SIZE.x), posmod(cell.y, GRID_SIZE.y))
+
+
+## Shortest offset between two cell positions; in Zen mode this crosses the board edge.
+func _cell_delta(from: Vector2, to: Vector2) -> Vector2:
+	var d := to - from
+	if wrap_walls:
+		d.x -= roundf(d.x / GRID_SIZE.x) * GRID_SIZE.x
+		d.y -= roundf(d.y / GRID_SIZE.y) * GRID_SIZE.y
+	return d
+
+
 func _update_board_origin() -> void:
 	board_origin = (get_viewport_rect().size - Vector2(GRID_SIZE * CELL_SIZE)) / 2.0
+	board.position = board_origin
+	board.size = Vector2(GRID_SIZE * CELL_SIZE)
 
 
 ## 0..1 progress through the current tick; 1 when the snake isn't moving.
@@ -331,31 +391,48 @@ func _move_progress() -> float:
 	return clampf(1.0 - move_timer.time_left / move_timer.wait_time, 0.0, 1.0)
 
 
+## Playfield-local pixel center of a (fractional) cell position.
 func _cell_center(cell: Vector2) -> Vector2:
-	return board_origin + (cell + Vector2(0.5, 0.5)) * CELL_SIZE
+	return (cell + Vector2(0.5, 0.5)) * CELL_SIZE
 
 
-func _segment_points() -> PackedVector2Array:
+## Interpolated segment positions in cell units, as one continuous chain:
+## across a wrap seam the chain runs off the board edge rather than jumping,
+## so connecting lines never span the whole board.
+func _segment_cells() -> PackedVector2Array:
 	var t := _move_progress()
-	var points := PackedVector2Array()
+	var cells := PackedVector2Array()
 	for i in snake.size():
 		# A freshly grown tail segment has no previous position; it holds still.
-		var from: Vector2i = prev_snake[i] if i < prev_snake.size() else snake[i]
-		points.append(_cell_center(Vector2(from).lerp(Vector2(snake[i]), t)))
-	return points
+		var from_cell: Vector2i = prev_snake[i] if i < prev_snake.size() else snake[i]
+		var from := Vector2(from_cell)
+		var pos := from + _cell_delta(from, Vector2(snake[i])) * t
+		if i > 0:
+			pos = cells[i - 1] + _cell_delta(cells[i - 1], pos)
+		cells.append(pos)
+	return cells
+
+
+## Board-sized offsets at which the chain must be redrawn so every part that ran off
+## one edge shows up on the opposite one. The Board control clips the excess.
+func _wrap_offsets(cells: PackedVector2Array) -> PackedVector2Array:
+	var offsets := PackedVector2Array([Vector2.ZERO])
+	if not wrap_walls:
+		return offsets
+	var lo := cells[0]
+	var hi := cells[0]
+	for c in cells:
+		lo = lo.min(c)
+		hi = hi.max(c)
+	offsets.clear()
+	var size := Vector2(GRID_SIZE)
+	for kx in range(floori(-hi.x / size.x), ceili((size.x - lo.x) / size.x) + 1):
+		for ky in range(floori(-hi.y / size.y), ceili((size.y - lo.y) / size.y) + 1):
+			offsets.append(Vector2(kx, ky) * size)
+	return offsets
 
 
 func _draw() -> void:
-	if shake > 0.0:
-		var offset := Vector2(randf_range(-1.0, 1.0), randf_range(-1.0, 1.0))
-		draw_set_transform(offset * SHAKE_PIXELS * shake)
-	_draw_board()
-	_draw_food()
-	_draw_eat_ring()
-	_draw_snake()
-
-
-func _draw_board() -> void:
 	var board_rect := Rect2(board_origin, Vector2(GRID_SIZE * CELL_SIZE))
 	draw_style_box(_board_style, board_rect.grow(BOARD_PADDING))
 	for y in GRID_SIZE.y:
@@ -365,15 +442,23 @@ func _draw_board() -> void:
 				draw_rect(Rect2(pos, Vector2(CELL_SIZE, CELL_SIZE)), BOARD_ALT_COLOR)
 
 
+func _draw_playfield() -> void:
+	_draw_food()
+	_draw_eat_ring()
+	var cells := _segment_cells()
+	for offset in _wrap_offsets(cells):
+		_draw_snake(cells, offset)
+
+
 func _draw_food() -> void:
 	var center := _cell_center(Vector2(food))
 	var radius := CELL_SIZE * 0.28 * (1.0 + 0.08 * sin(time * 6.0))
 	for k in 3:
 		var glow := FOOD_COLOR
 		glow.a = 0.07
-		draw_circle(center, radius * (1.5 + 0.5 * k), glow)
-	draw_circle(center, radius, FOOD_COLOR)
-	draw_circle(center + Vector2(-0.3, -0.3) * radius, radius * 0.3, Color(1, 1, 1, 0.45))
+		playfield.draw_circle(center, radius * (1.5 + 0.5 * k), glow)
+	playfield.draw_circle(center, radius, FOOD_COLOR)
+	playfield.draw_circle(center + Vector2(-0.3, -0.3) * radius, radius * 0.3, Color(1, 1, 1, 0.45))
 
 
 func _draw_eat_ring() -> void:
@@ -382,11 +467,13 @@ func _draw_eat_ring() -> void:
 	var color := FOOD_COLOR
 	color.a = 1.0 - eat_ring
 	var radius := CELL_SIZE * (0.3 + 0.9 * eat_ring)
-	draw_arc(_cell_center(Vector2(eat_ring_cell)), radius, 0.0, TAU, 32, color, 3.0, true)
+	playfield.draw_arc(_cell_center(Vector2(eat_ring_cell)), radius, 0.0, TAU, 32, color, 3.0, true)
 
 
-func _draw_snake() -> void:
-	var points := _segment_points()
+func _draw_snake(cells: PackedVector2Array, offset: Vector2) -> void:
+	var points := PackedVector2Array()
+	for c in cells:
+		points.append(_cell_center(c + offset))
 	var last := points.size() - 1
 
 	# Tail to head so the head is drawn on top.
@@ -397,10 +484,10 @@ func _draw_snake() -> void:
 		if i < last:
 			# Bridge to the next (thinner) segment so the body reads as one tube.
 			var next_radius := BODY_RADIUS * lerpf(1.0, TAIL_TAPER, float(i + 1) / last)
-			draw_line(points[i], points[i + 1], color, next_radius * 2.0)
+			playfield.draw_line(points[i], points[i + 1], color, next_radius * 2.0)
 		if i == 0:
 			radius *= 1.0 + 0.25 * eat_pulse
-		draw_circle(points[i], radius, color)
+		playfield.draw_circle(points[i], radius, color)
 
 	_draw_eyes(points[0], BODY_RADIUS * (1.0 + 0.25 * eat_pulse))
 
@@ -410,5 +497,5 @@ func _draw_eyes(head: Vector2, radius: float) -> void:
 	var side := Vector2(-forward.y, forward.x)
 	for s: float in [-1.0, 1.0]:
 		var eye := head + forward * radius * 0.3 + side * radius * 0.45 * s
-		draw_circle(eye, radius * 0.28, EYE_COLOR)
-		draw_circle(eye + forward * radius * 0.1, radius * 0.14, PUPIL_COLOR)
+		playfield.draw_circle(eye, radius * 0.28, EYE_COLOR)
+		playfield.draw_circle(eye + forward * radius * 0.1, radius * 0.14, PUPIL_COLOR)
