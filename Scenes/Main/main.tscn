@@ -1,0 +1,31 @@
+[gd_scene format=3 uid="uid://xd5ihtbnj8ux"]
+
+[ext_resource type="Script" uid="uid://dalrfx0j2piph" path="res://Scripts/Main/main.gd" id="1_1r6ip"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_1r6ip"]
+bg_color = Color(0.043, 0.051, 0.071, 0.72)
+
+[node name="Main" type="Node2D" unique_id=1299503051]
+script = ExtResource("1_1r6ip")
+
+[node name="MoveTimer" type="Timer" parent="." unique_id=354776769]
+
+[node name="CanvasLayer" type="CanvasLayer" parent="." unique_id=656890163]
+
+[node name="ScoreLabel" type="Label" parent="CanvasLayer" unique_id=85039361]
+anchors_preset = 10
+anchor_right = 1.0
+offset_top = 20.0
+offset_bottom = 52.0
+theme_override_colors/font_color = Color(0.62, 0.68, 0.78, 1)
+theme_override_font_sizes/font_size = 22
+horizontal_alignment = 1
+
+[node name="MessageLabel" type="Label" parent="CanvasLayer" unique_id=1673659464]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+theme_override_font_sizes/font_size = 28
+theme_override_styles/normal = SubResource("StyleBoxFlat_1r6ip")
+horizontal_alignment = 1
+vertical_alignment = 1
