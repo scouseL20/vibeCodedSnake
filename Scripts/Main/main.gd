@@ -36,6 +36,9 @@ const SWIPE_THRESHOLD := 28.0 # Drag distance (base pixels) before a swipe regis
 const TAP_SLOP := 16.0 # A touch that moves less than this counts as a tap.
 const VIBRATE_EAT_MS := 15
 const VIBRATE_DEATH_MS := 120
+# Ignore restart input briefly after dying, so a held finger or a mashed key
+# doesn't skip straight past the game-over screen.
+const RESTART_LOCKOUT_SECONDS := 0.5
 
 # Palette.
 const BOARD_COLOR := Color("12151c")
@@ -93,6 +96,7 @@ var _board_style := StyleBoxFlat.new()
 var _sfx: Dictionary[StringName, AudioStreamPlayer] = {}
 var _last_won := false
 var _last_new_best := false
+var _game_over_time := 0.0
 
 # Swipe tracking for the first finger down.
 var _touch_index := -1
@@ -127,9 +131,10 @@ func _process(delta: float) -> void:
 
 func _notification(what: int) -> void:
 	# Never let the player die while alt-tabbed, switching browser tabs or backgrounded.
-	if what in [NOTIFICATION_APPLICATION_FOCUS_OUT, NOTIFICATION_APPLICATION_PAUSED] \
-			and state == State.PLAYING:
-		_set_paused(true)
+	if what in [NOTIFICATION_APPLICATION_FOCUS_OUT, NOTIFICATION_APPLICATION_PAUSED]:
+		_touch_index = -1 # A finger held while focus is lost may never report its release.
+		if state == State.PLAYING:
+			_set_paused(true)
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -153,6 +158,8 @@ func _unhandled_input(event: InputEvent) -> void:
 
 	var dir := _direction_from_event(event)
 	if dir != Vector2i.ZERO:
+		if state == State.READY:
+			_start() # A direction on the title screen starts the game, same as a swipe.
 		_queue_direction(dir)
 
 
@@ -164,8 +171,14 @@ func _accept() -> void:
 		State.PAUSED:
 			_set_paused(false)
 		State.GAME_OVER:
+			if _restart_locked():
+				return
 			_reset()
 			_start()
+
+
+func _restart_locked() -> bool:
+	return state == State.GAME_OVER and time - _game_over_time < RESTART_LOCKOUT_SECONDS
 
 
 func _direction_from_event(event: InputEvent) -> Vector2i:
@@ -211,7 +224,9 @@ func _handle_touch(event: InputEvent) -> void:
 	if event is InputEventScreenTouch:
 		if event.pressed:
 			# Only the first finger steers, and touches on HUD buttons belong to them.
-			if _touch_index != -1 or _is_over_button(event.position):
+			# A new press on the tracked index means its release was lost: take it over.
+			if (_touch_index != -1 and event.index != _touch_index) \
+					or _is_over_button(event.position):
 				return
 			_touch_index = event.index
 			_touch_start = event.position
@@ -327,6 +342,8 @@ func _reset() -> void:
 
 
 func _toggle_mode() -> void:
+	if _restart_locked():
+		return
 	wrap_walls = not wrap_walls
 	_save_value("settings", "wrap_walls", wrap_walls)
 	_play_sfx(&"pause", 1.25)
@@ -357,6 +374,7 @@ func _game_over(won: bool) -> void:
 	_play_death_feedback()
 	_play_sfx(&"win" if won else &"die")
 	_vibrate(VIBRATE_DEATH_MS)
+	_game_over_time = time
 
 	_last_won = won
 	_last_new_best = score > high_score
@@ -525,6 +543,8 @@ func _cell_delta(from: Vector2, to: Vector2) -> Vector2:
 ## Swap the stretch base resolution to match the screen orientation, then refit the board.
 func _update_layout() -> void:
 	var window := get_window()
+	if window.size.x <= 0 or window.size.y <= 0:
+		return # Minimized: keep the last layout instead of fitting to nothing.
 	var now_portrait := window.size.y > window.size.x
 	var base := BASE_PORTRAIT if now_portrait else BASE_LANDSCAPE
 	if window.content_scale_size != base:
