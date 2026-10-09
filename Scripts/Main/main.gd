@@ -1,24 +1,41 @@
 extends Node2D
 
 ## Core snake loop: grid movement on a fixed tick, buffered input, food, growth, collision.
-## The snake is pure data (an array of grid cells); all rendering happens in _draw().
+## The snake is pure data (an array of grid cells); all rendering happens in draw callbacks.
 ## Visuals interpolate between the previous and current tick so movement glides,
 ## while the simulation itself stays strictly grid-based.
 ## Two modes: Classic (walls kill) and Zen (walls wrap around). Food and snake are drawn
 ## on Playfield inside the clipping Board control, so wrapped segments are cut at the edge.
+## Plays with keyboard, gamepad or touch (swipe to steer, tap to start/resume), and adapts
+## to landscape or portrait: the grid's long side follows the screen's long side.
 
 enum State { READY, PLAYING, PAUSED, GAME_OVER }
 
 const SAVE_PATH := "user://save.cfg"
 
-const GRID_SIZE := Vector2i(24, 16)
-const CELL_SIZE := 32
-const START_CELL := Vector2i(6, 8)
+# The grid is picked from the screen orientation at the start of each round.
+const GRID_LANDSCAPE := Vector2i(24, 16)
+const GRID_PORTRAIT := Vector2i(16, 24)
+# Stretch base resolutions. Portrait uses a smaller short side so text and buttons
+# come out larger on a phone held upright.
+const BASE_LANDSCAPE := Vector2i(1152, 648)
+const BASE_PORTRAIT := Vector2i(540, 960)
+# Room kept around the board (base pixels); the top margin holds the HUD.
+const BOARD_MARGIN_TOP := 64.0
+const BOARD_MARGIN_SIDE := 16.0
+const BOARD_MARGIN_BOTTOM := 16.0
+
 const START_LENGTH := 3
 const TICK_SECONDS := 0.12
 const MIN_TICK_SECONDS := 0.06 # Speed cap, reached at score 20.
 const TICK_STEP_PER_FOOD := 0.003
 const MAX_BUFFERED_INPUTS := 2
+
+# Touch.
+const SWIPE_THRESHOLD := 28.0 # Drag distance (base pixels) before a swipe registers.
+const TAP_SLOP := 16.0 # A touch that moves less than this counts as a tap.
+const VIBRATE_EAT_MS := 15
+const VIBRATE_DEATH_MS := 120
 
 # Palette.
 const BOARD_COLOR := Color("12151c")
@@ -33,7 +50,7 @@ const PUPIL_COLOR := Color("0b0d12")
 
 # Feel.
 const BOARD_PADDING := 8.0
-const BODY_RADIUS := CELL_SIZE * 0.42
+const BODY_RADIUS_RATIO := 0.42 # Head radius as a fraction of a cell.
 const TAIL_TAPER := 0.7 # Tail radius as a fraction of the head's.
 const SHAKE_PIXELS := 8.0
 
@@ -42,6 +59,8 @@ const SHAKE_PIXELS := 8.0
 @onready var playfield: Node2D = $Board/Playfield
 @onready var score_label: Label = $CanvasLayer/ScoreLabel
 @onready var message_label: Label = $CanvasLayer/MessageLabel
+@onready var pause_button: Button = $CanvasLayer/PauseButton
+@onready var mode_button: Button = $CanvasLayer/ModeButton
 
 var state: State = State.READY
 var wrap_walls := false # Zen mode.
@@ -52,9 +71,17 @@ var input_queue: Array[Vector2i] = []
 var food := Vector2i.ZERO
 var score := 0
 var high_score := 0
-var board_origin := Vector2.ZERO
 
-# Animation state, driven by tweens and read in _draw().
+# Layout.
+var grid_size := GRID_LANDSCAPE
+var cell_size := 32.0
+var board_origin := Vector2.ZERO
+var portrait := false
+
+# Last input came from a touchscreen; drives on-screen hints and haptics.
+var using_touch := false
+
+# Animation state, driven by tweens and read in the draw callbacks.
 var time := 0.0
 var eat_pulse := 0.0
 var eat_ring := 1.0
@@ -64,6 +91,14 @@ var death_flash := 0.0
 
 var _board_style := StyleBoxFlat.new()
 var _sfx: Dictionary[StringName, AudioStreamPlayer] = {}
+var _last_won := false
+var _last_new_best := false
+
+# Swipe tracking for the first finger down.
+var _touch_index := -1
+var _touch_start := Vector2.ZERO
+var _touch_anchor := Vector2.ZERO
+var _touch_swiped := false
 
 
 func _ready() -> void:
@@ -74,9 +109,11 @@ func _ready() -> void:
 
 	move_timer.timeout.connect(_on_move_timer_timeout)
 	playfield.draw.connect(_draw_playfield)
-	get_viewport().size_changed.connect(_update_board_origin)
-	_update_board_origin()
+	pause_button.pressed.connect(_on_pause_button_pressed)
+	mode_button.pressed.connect(_toggle_mode)
+	get_viewport().size_changed.connect(_update_layout)
 	_load_save()
+	_update_layout()
 	_reset()
 
 
@@ -84,30 +121,30 @@ func _process(delta: float) -> void:
 	time += delta
 	# Shake the whole node; the HUD lives on a CanvasLayer so it stays put.
 	position = Vector2(randf_range(-1.0, 1.0), randf_range(-1.0, 1.0)) * SHAKE_PIXELS * shake
-	queue_redraw()
+	# Only the playfield animates; the board itself redraws on layout changes.
 	playfield.queue_redraw()
 
 
 func _notification(what: int) -> void:
-	# Never let the player die while alt-tabbed.
-	if what == NOTIFICATION_APPLICATION_FOCUS_OUT and state == State.PLAYING:
+	# Never let the player die while alt-tabbed, switching browser tabs or backgrounded.
+	if what in [NOTIFICATION_APPLICATION_FOCUS_OUT, NOTIFICATION_APPLICATION_PAUSED] \
+			and state == State.PLAYING:
 		_set_paused(true)
 
 
 func _unhandled_input(event: InputEvent) -> void:
+	if event is InputEventScreenTouch or event is InputEventScreenDrag:
+		_handle_touch(event)
+		return
+	if event is InputEventKey or event is InputEventJoypadButton:
+		_set_using_touch(false)
+
 	if _is_pause_event(event) and state in [State.PLAYING, State.PAUSED]:
 		_set_paused(state == State.PLAYING)
 		return
 
 	if event.is_action_pressed("ui_accept"):
-		match state:
-			State.READY:
-				_start()
-			State.PAUSED:
-				_set_paused(false)
-			State.GAME_OVER:
-				_reset()
-				_start()
+		_accept()
 		return
 
 	if _is_key(event, KEY_M) and state in [State.READY, State.GAME_OVER]:
@@ -117,6 +154,18 @@ func _unhandled_input(event: InputEvent) -> void:
 	var dir := _direction_from_event(event)
 	if dir != Vector2i.ZERO:
 		_queue_direction(dir)
+
+
+## Space / Enter / tap: start, resume or restart depending on state.
+func _accept() -> void:
+	match state:
+		State.READY:
+			_start()
+		State.PAUSED:
+			_set_paused(false)
+		State.GAME_OVER:
+			_reset()
+			_start()
 
 
 func _direction_from_event(event: InputEvent) -> Vector2i:
@@ -152,6 +201,64 @@ func _is_pause_event(event: InputEvent) -> bool:
 func _is_key(event: InputEvent, keycode: Key) -> bool:
 	return event is InputEventKey and event.pressed and not event.echo \
 			and event.keycode == keycode
+
+
+## Swipes steer as soon as the drag passes the threshold, without lifting the finger,
+## and re-anchor so one continuous drag can chain several turns. A short touch is a tap.
+func _handle_touch(event: InputEvent) -> void:
+	_set_using_touch(true)
+
+	if event is InputEventScreenTouch:
+		if event.pressed:
+			# Only the first finger steers, and touches on HUD buttons belong to them.
+			if _touch_index != -1 or _is_over_button(event.position):
+				return
+			_touch_index = event.index
+			_touch_start = event.position
+			_touch_anchor = event.position
+			_touch_swiped = false
+		elif event.index == _touch_index:
+			_touch_index = -1
+			var is_tap: bool = not _touch_swiped \
+					and event.position.distance_to(_touch_start) < TAP_SLOP
+			if is_tap and state != State.PLAYING:
+				_accept()
+
+	elif event is InputEventScreenDrag and event.index == _touch_index:
+		var delta: Vector2 = event.position - _touch_anchor
+		if delta.length() < SWIPE_THRESHOLD:
+			return
+		_touch_anchor = event.position
+		_touch_swiped = true
+		if state == State.READY:
+			_start() # Swiping on the title screen starts straight away in that direction.
+		_queue_direction(_dominant_direction(delta))
+
+
+func _dominant_direction(delta: Vector2) -> Vector2i:
+	if absf(delta.x) > absf(delta.y):
+		return Vector2i.RIGHT if delta.x > 0.0 else Vector2i.LEFT
+	return Vector2i.DOWN if delta.y > 0.0 else Vector2i.UP
+
+
+func _is_over_button(pos: Vector2) -> bool:
+	for button: Button in [pause_button, mode_button]:
+		if button.is_visible_in_tree() and button.get_global_rect().has_point(pos):
+			return true
+	return false
+
+
+func _set_using_touch(value: bool) -> void:
+	if using_touch == value:
+		return
+	using_touch = value
+	if message_label.visible:
+		message_label.text = _message_text() # Swap key hints for touch hints in place.
+
+
+func _on_pause_button_pressed() -> void:
+	if state == State.PLAYING:
+		_set_paused(true)
 
 
 ## Queue turns so two quick presses within one tick both register,
@@ -190,38 +297,40 @@ func _on_move_timer_timeout() -> void:
 		_play_eat_feedback(new_head)
 		# Rising pitch as the score climbs makes a streak feel like it's building.
 		_play_sfx(&"eat", 1.0 + minf(score, 20) * 0.02)
+		_vibrate(VIBRATE_EAT_MS)
 		_spawn_food()
 	else:
 		snake.pop_back()
 
 
 func _reset() -> void:
+	# A fresh round adopts the current orientation; mid-round rotation keeps the grid.
+	grid_size = GRID_PORTRAIT if portrait else GRID_LANDSCAPE
+	_layout_board()
+
+	var start_cell := grid_size / Vector2i(4, 2)
 	snake.clear()
 	for i in START_LENGTH:
-		snake.append(START_CELL - Vector2i(i, 0))
+		snake.append(start_cell - Vector2i(i, 0))
 	prev_snake = snake.duplicate()
 	direction = Vector2i.RIGHT
 	input_queue.clear()
 	score = 0
+	high_score = _load_value("scores", _high_score_key(), 0)
 	move_timer.wait_time = TICK_SECONDS
 	_update_score()
 	_spawn_food()
 	state = State.READY
 	_board_style.border_color = ZEN_BORDER_COLOR if wrap_walls else BOARD_BORDER_COLOR
-	_show_message("SNAKE\n\n%s\n\nArrows / WASD to move\nEsc / P to pause\n\nPress Space to start" \
-			% _mode_line())
+	queue_redraw()
+	_show_message()
 
 
 func _toggle_mode() -> void:
 	wrap_walls = not wrap_walls
 	_save_value("settings", "wrap_walls", wrap_walls)
-	high_score = _load_value("scores", _high_score_key(), 0)
 	_play_sfx(&"pause", 1.25)
 	_reset()
-
-
-func _mode_line() -> String:
-	return "Mode: %s   (M to switch)" % ("ZEN - walls wrap" if wrap_walls else "CLASSIC")
 
 
 func _start() -> void:
@@ -237,7 +346,7 @@ func _set_paused(paused: bool) -> void:
 	move_timer.paused = paused
 	_play_sfx(&"pause", 1.0 if paused else 1.25)
 	if paused:
-		_show_message("PAUSED\n\nPress Space or Esc to resume")
+		_show_message()
 	else:
 		_hide_message()
 
@@ -247,29 +356,55 @@ func _game_over(won: bool) -> void:
 	move_timer.stop()
 	_play_death_feedback()
 	_play_sfx(&"win" if won else &"die")
+	_vibrate(VIBRATE_DEATH_MS)
 
-	var new_best := score > high_score
-	if new_best:
+	_last_won = won
+	_last_new_best = score > high_score
+	if _last_new_best:
 		high_score = score
 		_save_value("scores", _high_score_key(), high_score)
 		_update_score()
-
-	var lines: PackedStringArray = ["YOU WIN!" if won else "GAME OVER", "", "Score: %d" % score]
-	if new_best:
-		lines.append("New best!")
-	lines.append_array(PackedStringArray(["", "Press Space to restart", _mode_line()]))
-	_show_message("\n".join(lines))
+	_show_message()
 
 
-func _show_message(text: String) -> void:
-	message_label.text = text
+## Overlay text for the current state, worded for touch or keyboard.
+func _message_text() -> String:
+	match state:
+		State.READY:
+			if using_touch:
+				return "SNAKE\n\nSwipe to steer\nTap II (top right) to pause\n\nTap or swipe to start"
+			return "SNAKE\n\nArrows / WASD to move\nEsc / P to pause  ·  M to change mode" \
+					+ "\n\nPress Space to start"
+		State.PAUSED:
+			return "PAUSED\n\n" + ("Tap to resume" if using_touch else "Press Space or Esc to resume")
+		State.GAME_OVER:
+			var lines: PackedStringArray = [
+				"YOU WIN!" if _last_won else "GAME OVER", "", "Score: %d" % score]
+			if _last_new_best:
+				lines.append("New best!")
+			lines.append("")
+			lines.append("Tap to restart" if using_touch else "Press Space to restart")
+			return "\n".join(lines)
+	return ""
+
+
+func _show_message() -> void:
+	message_label.text = _message_text()
 	message_label.show()
 	message_label.modulate.a = 0.0
 	create_tween().tween_property(message_label, "modulate:a", 1.0, 0.2)
+	_update_buttons()
 
 
 func _hide_message() -> void:
 	message_label.hide()
+	_update_buttons()
+
+
+func _update_buttons() -> void:
+	pause_button.visible = state == State.PLAYING
+	mode_button.visible = state in [State.READY, State.GAME_OVER]
+	mode_button.text = "Mode: " + ("ZEN  ·  walls wrap" if wrap_walls else "CLASSIC")
 
 
 ## Each food eaten shortens the tick a little, down to MIN_TICK_SECONDS.
@@ -299,6 +434,12 @@ func _play_sfx(sfx_name: StringName, pitch := 1.0) -> void:
 	player.play()
 
 
+## Haptics only when playing by touch; a no-op on desktop and iOS browsers.
+func _vibrate(duration_ms: int) -> void:
+	if using_touch:
+		Input.vibrate_handheld(duration_ms)
+
+
 func _play_eat_feedback(cell: Vector2i) -> void:
 	eat_ring_cell = cell
 	var tween := create_tween().set_parallel()
@@ -319,12 +460,15 @@ func _play_death_feedback() -> void:
 
 func _load_save() -> void:
 	wrap_walls = _load_value("settings", "wrap_walls", false)
-	high_score = _load_value("scores", _high_score_key(), 0)
 
 
-## Classic keeps the original key so existing saves carry over.
+## One best score per mode and grid orientation, since the boards differ in shape.
+## Classic landscape keeps the original key so existing saves carry over.
 func _high_score_key() -> String:
-	return "high_score_zen" if wrap_walls else "high_score"
+	var key := "high_score_zen" if wrap_walls else "high_score"
+	if grid_size == GRID_PORTRAIT:
+		key += "_portrait"
+	return key
 
 
 func _load_value(section: String, key: String, default: Variant) -> Variant:
@@ -345,8 +489,8 @@ func _save_value(section: String, key: String, value: Variant) -> void:
 
 func _spawn_food() -> void:
 	var free_cells: Array[Vector2i] = []
-	for y in GRID_SIZE.y:
-		for x in GRID_SIZE.x:
+	for y in grid_size.y:
+		for x in grid_size.x:
 			var cell := Vector2i(x, y)
 			if cell not in snake:
 				free_cells.append(cell)
@@ -357,31 +501,65 @@ func _spawn_food() -> void:
 
 
 func _update_score() -> void:
-	score_label.text = "%s      Score: %d      Best: %d" \
+	score_label.text = "%s    Score: %d    Best: %d" \
 			% ["ZEN" if wrap_walls else "CLASSIC", score, high_score]
 
 
 func _in_bounds(cell: Vector2i) -> bool:
-	return cell.x >= 0 and cell.y >= 0 and cell.x < GRID_SIZE.x and cell.y < GRID_SIZE.y
+	return cell.x >= 0 and cell.y >= 0 and cell.x < grid_size.x and cell.y < grid_size.y
 
 
 func _wrap(cell: Vector2i) -> Vector2i:
-	return Vector2i(posmod(cell.x, GRID_SIZE.x), posmod(cell.y, GRID_SIZE.y))
+	return Vector2i(posmod(cell.x, grid_size.x), posmod(cell.y, grid_size.y))
 
 
 ## Shortest offset between two cell positions; in Zen mode this crosses the board edge.
 func _cell_delta(from: Vector2, to: Vector2) -> Vector2:
 	var d := to - from
 	if wrap_walls:
-		d.x -= roundf(d.x / GRID_SIZE.x) * GRID_SIZE.x
-		d.y -= roundf(d.y / GRID_SIZE.y) * GRID_SIZE.y
+		d.x -= roundf(d.x / grid_size.x) * grid_size.x
+		d.y -= roundf(d.y / grid_size.y) * grid_size.y
 	return d
 
 
-func _update_board_origin() -> void:
-	board_origin = (get_viewport_rect().size - Vector2(GRID_SIZE * CELL_SIZE)) / 2.0
+## Swap the stretch base resolution to match the screen orientation, then refit the board.
+func _update_layout() -> void:
+	var window := get_window()
+	var now_portrait := window.size.y > window.size.x
+	var base := BASE_PORTRAIT if now_portrait else BASE_LANDSCAPE
+	if window.content_scale_size != base:
+		window.content_scale_size = base
+
+	var rotated := now_portrait != portrait
+	portrait = now_portrait
+	_layout_board()
+
+	if rotated:
+		match state:
+			State.READY:
+				_reset() # Nothing at stake yet: switch to the grid that fits.
+			State.PLAYING:
+				_set_paused(true) # Give the player a beat to re-grip the phone.
+
+
+## Fit the current grid into the viewport with the largest whole-pixel cell size.
+func _layout_board() -> void:
+	var view := get_viewport_rect().size
+	var avail := view - Vector2(BOARD_MARGIN_SIDE * 2.0, BOARD_MARGIN_TOP + BOARD_MARGIN_BOTTOM)
+	cell_size = maxf(1.0, floorf(minf(avail.x / grid_size.x, avail.y / grid_size.y)))
+	var board_px := Vector2(grid_size) * cell_size
+	board_origin = Vector2((view.x - board_px.x) / 2.0,
+			BOARD_MARGIN_TOP + (avail.y - board_px.y) / 2.0)
 	board.position = board_origin
-	board.size = Vector2(GRID_SIZE * CELL_SIZE)
+	board.size = board_px
+
+	# Keep the HUD attached to the board's top edge rather than the screen's,
+	# so tall portrait screens don't leave the score floating far above it.
+	var hud_bottom := board_origin.y - BOARD_PADDING - 4.0
+	score_label.position.y = hud_bottom - score_label.size.y
+	pause_button.position = Vector2(board_origin.x + board_px.x + BOARD_PADDING - pause_button.size.x,
+			hud_bottom - pause_button.size.y)
+	queue_redraw()
 
 
 ## 0..1 progress through the current tick; 1 when the snake isn't moving.
@@ -391,9 +569,13 @@ func _move_progress() -> float:
 	return clampf(1.0 - move_timer.time_left / move_timer.wait_time, 0.0, 1.0)
 
 
+func _body_radius() -> float:
+	return cell_size * BODY_RADIUS_RATIO
+
+
 ## Playfield-local pixel center of a (fractional) cell position.
 func _cell_center(cell: Vector2) -> Vector2:
-	return (cell + Vector2(0.5, 0.5)) * CELL_SIZE
+	return (cell + Vector2(0.5, 0.5)) * cell_size
 
 
 ## Interpolated segment positions in cell units, as one continuous chain:
@@ -425,21 +607,22 @@ func _wrap_offsets(cells: PackedVector2Array) -> PackedVector2Array:
 		lo = lo.min(c)
 		hi = hi.max(c)
 	offsets.clear()
-	var size := Vector2(GRID_SIZE)
+	var size := Vector2(grid_size)
 	for kx in range(floori(-hi.x / size.x), ceili((size.x - lo.x) / size.x) + 1):
 		for ky in range(floori(-hi.y / size.y), ceili((size.y - lo.y) / size.y) + 1):
 			offsets.append(Vector2(kx, ky) * size)
 	return offsets
 
 
+## Static board: only redrawn on layout or mode changes, not every frame.
 func _draw() -> void:
-	var board_rect := Rect2(board_origin, Vector2(GRID_SIZE * CELL_SIZE))
+	var board_rect := Rect2(board_origin, Vector2(grid_size) * cell_size)
 	draw_style_box(_board_style, board_rect.grow(BOARD_PADDING))
-	for y in GRID_SIZE.y:
-		for x in GRID_SIZE.x:
+	for y in grid_size.y:
+		for x in grid_size.x:
 			if (x + y) % 2 == 0:
-				var pos := board_origin + Vector2(x, y) * CELL_SIZE
-				draw_rect(Rect2(pos, Vector2(CELL_SIZE, CELL_SIZE)), BOARD_ALT_COLOR)
+				var pos := board_origin + Vector2(x, y) * cell_size
+				draw_rect(Rect2(pos, Vector2(cell_size, cell_size)), BOARD_ALT_COLOR)
 
 
 func _draw_playfield() -> void:
@@ -452,7 +635,7 @@ func _draw_playfield() -> void:
 
 func _draw_food() -> void:
 	var center := _cell_center(Vector2(food))
-	var radius := CELL_SIZE * 0.28 * (1.0 + 0.08 * sin(time * 6.0))
+	var radius := cell_size * 0.28 * (1.0 + 0.08 * sin(time * 6.0))
 	for k in 3:
 		var glow := FOOD_COLOR
 		glow.a = 0.07
@@ -466,7 +649,7 @@ func _draw_eat_ring() -> void:
 		return
 	var color := FOOD_COLOR
 	color.a = 1.0 - eat_ring
-	var radius := CELL_SIZE * (0.3 + 0.9 * eat_ring)
+	var radius := cell_size * (0.3 + 0.9 * eat_ring)
 	playfield.draw_arc(_cell_center(Vector2(eat_ring_cell)), radius, 0.0, TAU, 32, color, 3.0, true)
 
 
@@ -475,21 +658,22 @@ func _draw_snake(cells: PackedVector2Array, offset: Vector2) -> void:
 	for c in cells:
 		points.append(_cell_center(c + offset))
 	var last := points.size() - 1
+	var body_radius := _body_radius()
 
 	# Tail to head so the head is drawn on top.
 	for i in range(last, -1, -1):
 		var w := float(i) / maxf(last, 1)
 		var color := HEAD_COLOR.lerp(TAIL_COLOR, w).lerp(Color.WHITE, death_flash)
-		var radius := BODY_RADIUS * lerpf(1.0, TAIL_TAPER, w)
+		var radius := body_radius * lerpf(1.0, TAIL_TAPER, w)
 		if i < last:
 			# Bridge to the next (thinner) segment so the body reads as one tube.
-			var next_radius := BODY_RADIUS * lerpf(1.0, TAIL_TAPER, float(i + 1) / last)
+			var next_radius := body_radius * lerpf(1.0, TAIL_TAPER, float(i + 1) / last)
 			playfield.draw_line(points[i], points[i + 1], color, next_radius * 2.0)
 		if i == 0:
 			radius *= 1.0 + 0.25 * eat_pulse
 		playfield.draw_circle(points[i], radius, color)
 
-	_draw_eyes(points[0], BODY_RADIUS * (1.0 + 0.25 * eat_pulse))
+	_draw_eyes(points[0], body_radius * (1.0 + 0.25 * eat_pulse))
 
 
 func _draw_eyes(head: Vector2, radius: float) -> void:
